@@ -1,0 +1,26 @@
+trigger:
+  branches:
+    include:
+      - team
+
+variables:
+- group: pacman-voda
+
+stages:
+- stage: BuildAndDeploy
+  displayName: "Build and Deploy"
+  jobs:
+  - job: BuildDeploy
+    displayName: "Build and Deploy Job"
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - checkout: self
+      submodules: true
+    - task: AzureStaticWebApp@0
+      displayName: "Deploy to Azure Static Web Apps"
+      inputs:
+        app_location: '/'
+        api_location: ''
+        output_location: '/'
+        azure_static_web_apps_api_token: '$(deployment_token)'
