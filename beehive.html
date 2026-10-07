@@ -1,0 +1,1127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Honeybee Colony · 2D Simulation</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; background: #9fd3f2; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  .panel { position: absolute; background: rgba(255, 250, 236, .93); color: #3b2a10; border-radius: 10px; box-shadow: 0 2px 10px rgba(0, 0, 0, .18); padding: 10px 12px; }
+  #stats { top: 12px; right: 12px; width: 232px; max-height: calc(100% - 130px); overflow: auto; }
+  #stats h3, #notes summary { margin: 0 0 6px; font-size: 14px; }
+  #stats table { width: 100%; border-collapse: collapse; }
+  #stats td { padding: 1px 0; }
+  #stats td:last-child { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+  #stats .sec { margin: 8px 0 2px; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; opacity: .6; }
+  #notes { top: 12px; left: 12px; width: 280px; max-width: calc(100% - 260px); }
+  #notes summary { cursor: pointer; }
+  #notes ul { margin: 0; padding-left: 16px; }
+  #notes li { margin-bottom: 3px; }
+  #controls { bottom: 12px; left: 50%; transform: translateX(-50%); display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: center; width: max-content; max-width: calc(100% - 24px); }
+  button { font: inherit; border: 1px solid #c79a3c; background: #fff7df; color: #3b2a10; border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+  button.on { background: #f2b531; font-weight: 600; }
+  label { white-space: nowrap; }
+  #tip { display: none; pointer-events: none; max-width: 240px; font-size: 12px; z-index: 2; }
+  #tip b { font-size: 13px; }
+  @media (max-width: 760px) { #stats { width: 180px; font-size: 12px; } #notes { display: none; } }
+</style>
+</head>
+<body>
+<canvas id="view"></canvas>
+<div id="stats" class="panel"><h3>Colony</h3><table id="statTable"></table></div>
+<details id="notes" class="panel">
+  <summary>How it works</summary>
+  <ul>
+    <li><b>Foragers</b> (21+ bee-days old) fly out, land on open flowers and suck nectar. Crop load tops out at ~40 mg, and loaded bees fly slower.</li>
+    <li><b>Flower constancy:</b> a bee keeps to one flower species per trip and remembers good patches.</li>
+    <li><b>Waggle dance</b> on the comb: the run angle is the flower's direction relative to the sun, and the duration grows with load. Idle foragers that watch it fly to the spot.</li>
+    <li><b>Receivers</b> take nectar from foragers and pack it into the top cells. Water falls from ~70% to ~18%, then the cell is capped.</li>
+    <li><b>Builders</b> (12–20 bee-days) make wax from honey, about 8 kg honey per kg wax, so building stalls when stores run low.</li>
+    <li><b>Task choice</b> follows response thresholds: each bee reacts to the colony's current need.</li>
+  </ul>
+  <p style="margin:6px 0 0;font-size:11px;opacity:.7">Speeds (m/s), loads and sugar levels are realistic. Bees, comb and flowers are drawn enlarged, and time runs fast (one day ≈ 4 min).</p>
+</details>
+<div id="controls" class="panel">
+  <button id="playBtn">Pause</button>
+  <button class="spd on" data-speed="1">1×</button>
+  <button class="spd" data-speed="4">4×</button>
+  <button class="spd" data-speed="16">16×</button>
+  <label><input type="checkbox" id="trails"> Flight trails</label>
+  <label><input type="checkbox" id="showDance" checked> Dance arrows</label>
+  <button id="reset">Restart colony</button>
+</div>
+<div id="tip" class="panel"></div>
+<script>
+(() => {
+'use strict';
+
+/* ---------- Units: metres and seconds. y points up, ground is y = 0 ---------- */
+const GARDEN_W = 36, GARDEN_H = 20;
+const HIVE = { x0: 2.0, x1: 8.4, y0: 1.4, y1: 6.6 };          // observation hive box
+const ENTRY_OUT = { x: HIVE.x1 + 0.35, y: HIVE.y0 + 0.4 };    // landing board, outside
+const ENTRY_IN = { x: HIVE.x1 - 0.45, y: HIVE.y0 + 0.5 };     // where bees cross into the comb
+const DANCE_FLOOR = { x: (HIVE.x0 + HIVE.x1) / 2, y: HIVE.y1 - 1.7 };
+const CELL_A = 0.46;                    // across-flats width of a cell (m)
+const CELL_S = CELL_A / Math.sqrt(3);   // hexagon circumradius (pointy-top cells)
+const ROW_H = 1.5 * CELL_S;             // vertical pitch between rows
+const CELL_CAP = 160;                   // max nectar solution per cell (mg)
+const LOAD_MAX = 40;                    // forager crop load (mg of nectar solution)
+const FEED_RATE = 1.5;                  // mg/s sucked through the proboscis
+const FLOWER_CAP = 8;                   // mg nectar a flower can hold
+const SECRETION = 0.8;                  // mg/s peak nectar secretion per open flower
+const VMAX = 7.0, AMAX = 12.0;          // flight envelope (m/s, m/s²)
+const DRAG_K = 0.04;                    // quadratic air drag (1/m)
+const WALK_V = 0.5;                     // walking speed on comb (m/s), raised to match the enlarged comb
+const WATER_START = 0.70, WATER_RIPE = 0.18; // nectar ~70% water, capped honey ~18%
+const RIPEN_RATE = 0.0035;              // water fraction lost per second
+const BUILD_S = 22;                     // seconds for one builder to finish a cell
+const CELL_HONEY = 50;                  // mg of honey eaten per cell of wax built
+const HONEY_RESERVE = 150;              // mg the colony keeps in store before builders may eat
+const DAY_S = 240;                      // sim seconds per day
+const BEE_DAY_S = 30;                   // sim seconds per bee-day (lifespan ≈ 42 bee-days)
+const START_FRAC = 0.30;                // start of the day (≈07:10)
+const MAX_BEES = 60;
+const TAU = Math.PI * 2;
+
+const SPECIES = [
+  { name: 'Cornflower', petal: '#5b8def', eye: '#ffe27a' },
+  { name: 'Poppy', petal: '#e5483b', eye: '#2a1a12' },
+  { name: 'Dandelion', petal: '#f7d12e', eye: '#e39b00' },
+  { name: 'Clover', petal: '#c48cf0', eye: '#ffd6f2' },
+];
+
+/* ---------- Small helpers ---------- */
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const smooth = (a, b, v) => { const x = clamp((v - a) / (b - a), 0, 1); return x * x * (3 - 2 * x); };
+const dist = (ax, ay, bx, by) => Math.hypot(ax - bx, ay - by);
+
+/* ---------- Simulation state ---------- */
+let t = 0, speed = 1, paused = false, showTrails = false, showDance = true;
+let bees = [], flowers = [], pkts = [], dances = [], flakes = [];
+const cells = new Map();                // "c,r" -> cell
+let stats = null;
+let stock = 0;                          // mg of nectar solution stored in the comb (cached each step)
+const sun = { vx: -1, vy: 0, elev: -1, daylight: 0, warmth: 0, hour: 0 };
+const wind = { x: 0.5, y: 0 };
+let nextId = 1;
+
+/* Sun moves on a half-circle across the sky of the garden plane. Its direction is
+   the reference bees use for the waggle dance ("up" on the comb = sun). */
+function updateSun() {
+  const frac = (t / DAY_S + START_FRAC) % 1;
+  const a = TAU * (frac - 0.25);
+  sun.vx = -Math.cos(a);
+  sun.vy = Math.sin(a);
+  sun.elev = Math.sin(a);
+  sun.daylight = smooth(-0.02, 0.22, sun.elev);
+  sun.warmth = Math.max(0, sun.elev);
+  sun.hour = (6 + (frac - 0.25) * 24 + 24) % 24;
+}
+
+function updateWind() {
+  wind.x = 0.6 + 0.5 * Math.sin(t * 0.05) + 0.25 * Math.sin(t * 0.37);
+  wind.y = 0.15 * Math.sin(t * 0.11);
+}
+
+/* ---------- Flowers: four species in patches, nectar regrows in daylight ---------- */
+function makeFlowers() {
+  flowers = [];
+  for (let i = 0; i < 26; i++) {
+    const sp = i % SPECIES.length;
+    flowers.push({
+      sp, x: 13 + sp * 5.6 + rand(-2.0, 2.0), h: rand(0.9, 2.3),
+      nectar: FLOWER_CAP * rand(0.3, 0.9), open: false, sway: rand(0, TAU), visits: 0,
+    });
+  }
+}
+
+function updateFlowers(dt) {
+  const secretion = SECRETION * sun.daylight * (0.35 + 0.65 * sun.warmth);
+  for (const f of flowers) {
+    f.open = sun.daylight > 0.25;
+    if (f.open) f.nectar = Math.min(FLOWER_CAP, f.nectar + secretion * dt);
+  }
+}
+
+/* ---------- Comb: pointy-top hexagons in an offset grid, hanging from the top bar ---------- */
+const keyOf = (c, r) => c + ',' + r;
+
+function siteXY(c, r) {
+  return {
+    x: HIVE.x0 + 0.27 + CELL_A / 2 + c * CELL_A + (r & 1 ? CELL_A / 2 : 0),
+    y: HIVE.y1 - 0.08 - CELL_S - r * ROW_H,
+  };
+}
+
+function insideComb(x, y) {             // whole cell footprint lies inside the hive box
+  return x - CELL_A / 2 >= HIVE.x0 + 0.04 && x + CELL_A / 2 <= HIVE.x1 - 0.04 && y - CELL_S >= HIVE.y0 + 0.04;
+}
+
+function neighbours(c, r) {             // six neighbours of an offset hex grid (row 0 at the top)
+  return (r & 1)
+    ? [[c + 1, r], [c - 1, r], [c, r - 1], [c + 1, r - 1], [c, r + 1], [c + 1, r + 1]]
+    : [[c + 1, r], [c - 1, r], [c - 1, r - 1], [c, r - 1], [c - 1, r + 1], [c, r + 1]];
+}
+
+function addCell(c, r, extra) {
+  const p = siteXY(c, r);
+  const cell = Object.assign({ c, r, x: p.x, y: p.y, state: 'building', prog: 0, mg: 0, water: WATER_START, capped: false }, extra);
+  cells.set(keyOf(c, r), cell);
+  return cell;
+}
+
+/* Empty positions that touch the top bar or an existing cell: where builders may start a cell */
+function getSites() {
+  const out = new Map();
+  const consider = (c, r) => {
+    if (r < 0) return;
+    const k = keyOf(c, r);
+    if (cells.has(k) || out.has(k)) return;
+    const p = siteXY(c, r);
+    if (insideComb(p.x, p.y)) out.set(k, { c, r, x: p.x, y: p.y });
+  };
+  for (const cell of cells.values()) for (const [c, r] of neighbours(cell.c, cell.r)) consider(c, r);
+  for (let c = -1; c < 16; c++) consider(c, 0);
+  return [...out.values()];
+}
+
+function hasStorage() {                  // a built, uncapped cell with room for nectar
+  for (const c of cells.values()) if (c.state === 'built' && !c.capped && c.mg < CELL_CAP - 1) return true;
+  return false;
+}
+
+// Builders eat capped honey only above the colony's reserve. With no free cell to store
+// nectar in, the reserve is released so that more cells can be built.
+const canEatForWax = () => cappedHoney() > HONEY_RESERVE || !hasStorage();
+
+function stockTotal() {
+  let s = 0;
+  for (const c of cells.values()) s += c.mg;
+  return s;
+}
+
+/* Builders eat ripe (capped) honey to make wax. Unripe nectar is not eaten.
+   Returns false, with no change, if there is not enough capped honey. */
+function cappedHoney() {
+  let s = 0;
+  for (const c of cells.values()) if (c.capped) s += c.mg;
+  return s;
+}
+
+function eatHoney(amount) {
+  if (cappedHoney() < amount) return false;
+  let need = amount;
+  for (const c of cells.values()) {
+    if (need <= 0) break;
+    if (!c.capped || c.mg <= 0) continue;
+    const take = Math.min(c.mg, need);
+    c.mg -= take; need -= take;
+  }
+  stock -= amount;
+  return true;
+}
+
+function depositNectar(cell, mg) {
+  cell.water = (cell.water * cell.mg + WATER_START * mg) / (cell.mg + mg);
+  cell.mg += mg;
+  stock += mg;
+}
+
+/* ---------- Bees ---------- */
+function makeBee(age, x, y) {
+  return {
+    id: nextId++, age, x, y, vx: 0, vy: 0,
+    mode: 'inside', task: 'rest', sub: '', timer: 0,
+    tx: x, ty: y, load: 0, species: -1, flower: -1, memFlower: -1, lastFlower: -1,
+    recruit: null, pkt: null, carry: 0, cell: null, dance: null, stall: 0, quality: 0, trailT: 0,
+    thr: rand(0.35, 0.9),             // response threshold (Bonabeau et al. 1996 model)
+    decideT: rand(1, 4), phase: rand(0, TAU), flip: 1,
+    alpha: 1, dying: false, trail: [],
+  };
+}
+
+function spawnInside(age) {
+  return makeBee(age, rand(HIVE.x0 + 0.8, HIVE.x1 - 0.8), rand(HIVE.y0 + 0.6, HIVE.y1 - 0.6));
+}
+
+/* ---------- Reset ---------- */
+function resetWorld() {
+  t = 0;
+  cells.clear();
+  addCell(5, 0, { state: 'built', mg: 120, water: 0.17, capped: true });  // starter reserves
+  addCell(6, 0, { state: 'built', mg: 90, water: 0.17, capped: true });
+  bees = [];
+  for (let i = 0; i < MAX_BEES; i++) bees.push(spawnInside(rand(0, 40)));
+  pkts.length = 0; dances.length = 0; flakes = [];
+  stats = { delivered: 0, dances: 0, cellsDone: 0, trips: 0 };
+  makeFlowers();
+  updateSun(); updateWind();
+}
+
+/* ---------- Flight physics (outside the hive) ----------
+   Newtonian point mass: thrust is a bounded acceleration (AMAX), air drag acts on
+   airspeed (velocity minus wind), and a loaded bee is heavier, so it accelerates less
+   and flies slower. Bees brake so they arrive with ~zero speed (v² = 2·a·d). */
+function flyStep(b, tx, ty, dt, arriveR) {
+  const load = b.load / LOAD_MAX;
+  const vmax = VMAX * (1 - 0.12 * load);
+  const amax = AMAX * (1 - 0.2 * load);
+  const dx = tx - b.x, dy = ty - b.y;
+  const d = Math.hypot(dx, dy) || 1e-6;
+  const vd = Math.min(vmax, Math.sqrt(2 * amax * d));   // braking curve
+  let ax = (dx / d * vd - b.vx) * 3;                    // proportional steering
+  let ay = (dy / d * vd - b.vy) * 3;
+  const am = Math.hypot(ax, ay);
+  if (am > amax) { ax *= amax / am; ay *= amax / am; }
+  const ux = b.vx - wind.x, uy = b.vy - wind.y;         // drag on airspeed
+  const us = Math.hypot(ux, uy);
+  ax -= DRAG_K * us * ux;
+  ay -= DRAG_K * us * uy;
+  b.vx += ax * dt; b.vy += ay * dt;
+  b.x += b.vx * dt; b.y += b.vy * dt;
+  if (b.y < 0.15) { b.y = 0.15; if (b.vy < 0) b.vy = 0; }
+  return d < arriveR && Math.hypot(b.vx, b.vy) < 0.6;
+}
+
+function walkTo(b, tx, ty, dt) {           // walking on the comb: slow, straight, no flight
+  const d = dist(b.x, b.y, tx, ty);
+  if (d <= WALK_V * dt) { b.x = tx; b.y = ty; return true; }
+  b.x += (tx - b.x) / d * WALK_V * dt;
+  b.y += (ty - b.y) / d * WALK_V * dt;
+  b.flip = tx >= b.x ? 1 : -1;
+  return false;
+}
+
+/* ---------- Foraging ---------- */
+// Flower choice: prefer open flowers with nectar, close ones, the same species (constancy)
+// and the patch the bee remembers. Scores are noisy so bees do not all pick one flower.
+function pickFlower(b) {
+  let best = -1, bestS = 0;
+  for (let i = 0; i < flowers.length; i++) {
+    const f = flowers[i];
+    if (!f.open || f.nectar < 0.6) continue;
+    const d = dist(b.x, b.y, f.x, f.h);
+    let s = (f.nectar / FLOWER_CAP + 0.15) / (d + 3);
+    if (i === b.memFlower) s *= 2.2;
+    if (b.species >= 0 && f.sp === b.species) s *= 2.5;
+    s *= rand(0.7, 1.3);
+    if (s > bestS) { bestS = s; best = i; }
+  }
+  if (best >= 0 && b.species < 0) b.species = flowers[best].sp;
+  return best;
+}
+
+function goHome(b) {
+  b.sub = 'toHive';
+  b.recruit = null;
+  b.flower = -1;
+}
+
+function outsideBee(b, dt) {
+  if (b.sub === 'toFlower') {
+    if (b.recruit) {                        // recruited: fly to the danced location first
+      if (flyStep(b, b.recruit.x, b.recruit.y, dt, 1.0)) {
+        b.recruit = null;
+        b.flower = pickFlower(b);
+        if (b.flower < 0) return goHome(b);
+      }
+      return;
+    }
+    const f0 = flowers[b.flower];
+    if (!f0 || !f0.open || f0.nectar < 0.5) {
+      b.flower = pickFlower(b);
+      if (b.flower < 0) return goHome(b);
+    }
+    const f = flowers[b.flower];
+    if (flyStep(b, f.x, f.h + 0.12, dt, 0.1)) {   // touch down on the flower head
+      b.sub = 'feed'; b.timer = 0; b.vx = 0; b.vy = 0;
+      b.x = f.x; b.y = f.h + 0.12;
+    }
+    return;
+  }
+  if (b.sub === 'feed') {
+    const f = flowers[b.flower];
+    b.timer += dt;
+    const take = Math.min(f.nectar, FEED_RATE * dt, LOAD_MAX - b.load);
+    if (take > 0) {
+      f.nectar -= take; b.load += take;
+      b.lastFlower = b.flower;
+      b.phase += dt * 30;                   // proboscis drinking animation
+    }
+    if (f.nectar < 0.05 || b.load >= LOAD_MAX - 0.01) {
+      f.visits++;
+      if (b.load >= LOAD_MAX - 0.01 || sun.daylight < 0.3) return goHome(b);
+      b.flower = pickFlower(b);             // next flower, same species if possible
+      if (b.flower < 0) return goHome(b);
+      b.sub = 'toFlower';
+      b.vy = 0.8;                           // take-off hop
+    }
+    return;
+  }
+  if (b.sub === 'toHive') {
+    if (flyStep(b, ENTRY_OUT.x, ENTRY_OUT.y, dt, 0.12)) enterHive(b);
+  }
+}
+
+// Leave the hive from the entrance on a trip
+function startTrip(b) {
+  b.mode = 'outside';
+  b.x = ENTRY_OUT.x; b.y = ENTRY_OUT.y; b.vx = 0; b.vy = 0;
+  b.task = 'forage';
+  b.load = 0;
+  b.memFlower = b.lastFlower;
+  if (!b.recruit && Math.random() < 0.3) b.species = -1;   // occasionally switch species
+  b.flower = -1;
+  b.sub = 'toFlower';
+  b.trail = [];
+  b.flower = b.recruit ? -1 : pickFlower(b);
+  if (b.flower < 0 && !b.recruit) return goHome(b);
+  stats.trips++;
+}
+
+// Back at the entrance: the forager hands its crop to a receiver bee (trophallaxis)
+function enterHive(b) {
+  b.mode = 'inside';
+  b.x = ENTRY_IN.x; b.y = ENTRY_IN.y; b.tx = b.x; b.ty = b.y;
+  b.vx = 0; b.vy = 0;
+  b.task = 'forage';
+  if (b.load < 1) { b.sub = ''; b.task = 'rest'; b.decideT = rand(2, 5); b.load = 0; return; }
+  b.sub = 'unload';
+  b.quality = b.load / LOAD_MAX;
+  b.pkt = { bee: b, mg: b.load, taken: false };
+  pkts.push(b.pkt);
+}
+
+/* ---------- Inside the hive ---------- */
+// Response-threshold task choice: the probability of taking a task is s²/(s²+θ²), where
+// s is the colony's need for that task and θ is the bee's own threshold.
+const respond = (s, thr) => (s * s) / (s * s + thr * thr);
+const wrapA = (a) => { while (a > Math.PI) a -= TAU; while (a < -Math.PI) a += TAU; return a; };
+
+function chooseTask(b) {
+  if (b.age < 3) return 'clean';
+  if (b.age >= 21) {                       // foragers: more trips when honey stores run low
+    const need = clamp(1 - stock / 300, 0, 1) * 0.8 + 0.2;
+    if (sun.daylight > 0.35 && Math.random() < respond(need * sun.daylight, b.thr)) return 'forage';
+    return 'rest';
+  }
+  if (b.age >= 12) {                       // builders: wax production needs cells and honey
+    const sites = getSites().length;
+    const buildNeed = canEatForWax() ? Math.min(1, sites / 8) : 0;
+    if (Math.random() < respond(buildNeed, b.thr)) return 'build';
+  }
+  const recvNeed = Math.min(1, pkts.length / 2 + 0.05);
+  if (Math.random() < respond(recvNeed, b.thr)) return 'receive';
+  return 'rest';
+}
+
+function setTask(b, task) {
+  if (b.cell) { b.cell.owner = null; b.cell = null; }
+  if (b.dance) removeDance(b);
+  b.task = task;
+  b.sub = task === 'forage' ? 'toExit' : task === 'dance' ? 'toFloor' : '';
+  b.timer = 0; b.stall = 0;
+  b.decideT = rand(4, 8);
+}
+
+// Wander around a home spot on the comb, pausing a while at each stop
+function wander(b, dt, cx, cy, rx, ry) {
+  if (b.timer > 0) { b.timer -= dt; return; }
+  if (walkTo(b, b.tx, b.ty, dt)) {
+    b.timer = rand(1, 4);
+    b.tx = clamp(cx + rand(-rx, rx), HIVE.x0 + 0.3, HIVE.x1 - 0.3);
+    b.ty = clamp(cy + rand(-ry, ry), HIVE.y0 + 0.3, HIVE.y1 - 0.3);
+  }
+}
+
+function insideBee(b, dt) {
+  switch (b.task) {
+    case 'clean': return cleanLoop(b, dt);
+    case 'rest': return restLoop(b, dt);
+    case 'receive': return receiveLoop(b, dt);
+    case 'build': return buildLoop(b, dt);
+    case 'dance': return danceLoop(b, dt);
+    case 'forage': return forageInside(b, dt);
+  }
+}
+
+function cleanLoop(b, dt) {              // young bees clean empty cells near the top
+  wander(b, dt, (HIVE.x0 + HIVE.x1) / 2, HIVE.y1 - 1.4, 2.2, 0.9);
+  if (b.age >= 3) setTask(b, 'rest');
+}
+
+function restLoop(b, dt) {               // resting cluster on the lower comb
+  wander(b, dt, (HIVE.x0 + HIVE.x1) / 2, HIVE.y0 + 1.3, 2.4, 0.7);
+  b.decideT -= dt;
+  if (b.decideT <= 0) {
+    const nt = chooseTask(b);
+    if (nt !== 'rest') setTask(b, nt);
+    else b.decideT = rand(4, 8);
+  }
+}
+
+// Storage for nectar: built, not yet capped, with room. Upper cells first (honey is stored high).
+function chooseStorage(b) {
+  let best = null, bestS = Infinity;
+  for (const c of cells.values()) {
+    if (c.state !== 'built' || c.capped || c.mg >= CELL_CAP - 1) continue;
+    const s = dist(b.x, b.y, c.x, c.y) + 0.12 * c.r;
+    if (s < bestS) { bestS = s; best = c; }
+  }
+  return best;
+}
+
+function receiveLoop(b, dt) {
+  if (b.sub === 'toForager') {           // walk to the forager and take its crop
+    const f = b.pkt.bee;
+    if (f.dying) { b.pkt = null; b.sub = ''; return; }
+    if (walkTo(b, f.x, f.y, dt)) {
+      b.carry = b.pkt.mg;
+      b.pkt.taken = true;
+      f.load = 0; f.pkt = null;
+      f.sub = 'released'; f.timer = rand(1.2, 2.0);
+      b.pkt = null;
+      b.sub = 'toCell';
+    }
+    return;
+  }
+  if (b.sub === 'toCell') {              // carry nectar to a storage cell and pack it in
+    if (!b.cell) b.cell = chooseStorage(b);
+    if (!b.cell) return;                 // no room yet: hold the nectar and wait
+    if (walkTo(b, b.cell.x, b.cell.y, dt)) {
+      // pour in only what fits; if the cell is now full, keep the rest and look for another
+      const put = Math.min(b.carry, Math.max(0, CELL_CAP - b.cell.mg));
+      if (put > 0) { depositNectar(b.cell, put); stats.delivered += put; b.carry -= put; }
+      b.cell = null;
+      if (b.carry <= 0.01) { b.carry = 0; b.sub = ''; }
+    }
+    return;
+  }
+  wander(b, dt, ENTRY_IN.x - 0.9, ENTRY_IN.y + 0.9, 0.7, 0.7);
+  if (pkts.length) { b.pkt = pkts.shift(); b.sub = 'toForager'; return; }
+  b.decideT -= dt;
+  if (b.decideT <= 0) {
+    const nt = chooseTask(b);
+    if (nt !== 'receive') setTask(b, nt);
+    else b.decideT = rand(4, 8);
+  }
+}
+
+// Wax building: pick (or resume) an empty site touching the comb, then secrete wax.
+// Wax costs honey (about 8:1), so a builder stalls when the comb has no honey to eat.
+function buildLoop(b, dt) {
+  if (!b.cell) {
+    let target = null;
+    for (const c of cells.values()) if (c.state === 'building' && c.owner == null) { target = c; break; }
+    if (!target) {
+      const sites = getSites();
+      if (!sites.length || !canEatForWax()) return setTask(b, 'rest');
+      let total = 0;
+      const w = sites.map((s) => { const v = 1 / (0.4 + dist(b.x, b.y, s.x, s.y)); total += v; return v; });
+      let r = Math.random() * total, pick = sites[0];
+      for (let i = 0; i < sites.length; i++) { r -= w[i]; if (r <= 0) { pick = sites[i]; break; } }
+      target = addCell(pick.c, pick.r);
+    }
+    target.owner = b.id;
+    b.cell = target;
+    b.sub = 'toSite';
+    return;
+  }
+  const cell = b.cell;
+  if (b.sub === 'toSite') {
+    if (walkTo(b, cell.x, cell.y, dt)) b.sub = 'building';
+    return;
+  }
+  if (canEatForWax() && eatHoney(CELL_HONEY / BUILD_S * dt)) {
+    b.stall = 0;
+    cell.prog += dt / BUILD_S;
+    if (Math.random() < 3 * dt) flakes.push({ x: cell.x + rand(-0.2, 0.2), y: cell.y + rand(-0.15, 0.15), vx: rand(-0.3, 0.3), vy: rand(0.0, 0.4), life: 1.5 });
+    if (cell.prog >= 1) {
+      cell.state = 'built'; cell.prog = 1; cell.owner = null;
+      stats.cellsDone++;
+      b.cell = null;
+      setTask(b, chooseTask(b));
+    }
+  } else {
+    b.stall += dt;                       // no honey: wax production pauses
+    if (b.stall > 8) { cell.owner = null; setTask(b, 'rest'); }
+  }
+}
+
+/* ---------- Waggle dance ----------
+   A forager that brought a good load dances on the dance floor. The run angle is the
+   flower's bearing measured from the sun (the bees treat "up" on the comb as the sun).
+   The dance duration grows with the load. Idle foragers that watch it fly to the spot. */
+function startDance(b) {
+  const f = flowers[b.lastFlower];
+  if (!f) return setTask(b, 'rest');
+  const d = dist(ENTRY_OUT.x, ENTRY_OUT.y, f.x, f.h);
+  const flowerAng = Math.atan2(f.h - ENTRY_OUT.y, f.x - ENTRY_OUT.x);
+  const sunAng = Math.atan2(sun.vy, sun.vx);
+  const angle = wrapA(flowerAng - sunAng) + rand(-0.15, 0.15);   // ±9° dance error
+  const tgtAng = sunAng + angle;                                  // what the watchers decode
+  const dance = {
+    x: DANCE_FLOOR.x, y: DANCE_FLOOR.y, angle, quality: b.quality, species: f.sp,
+    tgt: { x: ENTRY_OUT.x + d * Math.cos(tgtAng), y: ENTRY_OUT.y + d * Math.sin(tgtAng) },
+  };
+  b.dance = dance;
+  dances.push(dance);
+  b.timer = 1.5 + 4 * b.quality;     // seconds of dancing
+  b.sub = 'dancing';
+  stats.dances++;
+}
+
+function removeDance(b) {
+  const i = dances.indexOf(b.dance);
+  if (i >= 0) dances.splice(i, 1);
+  b.dance = null;
+}
+
+function danceLoop(b, dt) {
+  if (b.sub === 'toFloor') {
+    if (walkTo(b, DANCE_FLOOR.x, DANCE_FLOOR.y, dt)) startDance(b);
+    return;
+  }
+  if (b.sub !== 'dancing') return;
+  // figure-eight waggle path; the body wiggles while the bee runs straight
+  b.phase += dt * 5;
+  b.x = DANCE_FLOOR.x + 0.28 * Math.sin(b.phase);
+  b.y = DANCE_FLOOR.y + 0.18 * Math.sin(2 * b.phase);
+  b.flip = Math.cos(b.phase) >= 0 ? 1 : -1;
+  b.timer -= dt;
+  if (b.timer <= 0) {
+    removeDance(b);
+    setTask(b, 'forage');
+  }
+}
+
+// Forager waiting in the hive: leave on a trip, wait to be unloaded, then decide what next
+function forageInside(b, dt) {
+  if (b.sub === 'toExit') {
+    if (walkTo(b, ENTRY_IN.x, ENTRY_IN.y, dt)) {
+      if (sun.daylight < 0.3) return setTask(b, 'rest');
+      startTrip(b);
+    }
+    return;
+  }
+  if (b.sub === 'unload') {              // handing over the crop to a receiver
+    if (b.pkt && b.pkt.taken) { b.pkt = null; b.sub = 'released'; }
+    return;
+  }
+  if (b.sub === 'released') {
+    b.timer -= dt;
+    if (b.timer > 0) return;
+    if (b.quality >= 0.7 && b.lastFlower >= 0) { b.task = 'dance'; b.sub = 'toFloor'; }
+    else if (sun.daylight > 0.35 && Math.random() < 0.7) b.sub = 'toExit';
+    else setTask(b, 'rest');
+  }
+}
+
+/* ---------- One simulation step (dt in sim seconds) ---------- */
+function step(dt) {
+  t += dt;
+  updateSun(); updateWind(); updateFlowers(dt);
+  stock = stockTotal();
+
+  // Separation: bees in the air keep a body-length of personal space
+  const air = bees.filter((b) => b.mode === 'outside' && !b.dying && b.sub !== 'feed');
+  for (let i = 0; i < air.length; i++) {
+    for (let j = i + 1; j < air.length; j++) {
+      const a = air[i], c = air[j];
+      const dx = a.x - c.x, dy = a.y - c.y, d = Math.hypot(dx, dy);
+      if (d > 0 && d < 0.7) {
+        const f = (4 * (0.7 - d) / 0.7) / d * dt;
+        a.vx += dx * f; a.vy += dy * f;
+        c.vx -= dx * f; c.vy -= dy * f;
+      }
+    }
+  }
+
+  // Recruitment: idle foragers that are near a dance may follow it to the advertised spot
+  if (sun.daylight > 0.35 && dances.length) {
+    for (const b of bees) {
+      if (b.dying || b.mode !== 'inside' || b.task !== 'rest' || b.age < 21) continue;
+      for (const d of dances) {
+        if (dist(b.x, b.y, d.x, d.y) < 2.5 && Math.random() < 0.6 * dt * (0.4 + d.quality)) {
+          b.recruit = { x: d.tgt.x, y: d.tgt.y, sp: d.species };
+          b.species = d.species;
+          setTask(b, 'forage');
+          break;
+        }
+      }
+    }
+  }
+
+  for (const b of bees) {
+    if (b.dying) { b.alpha -= dt * 0.5; continue; }
+    if (b.mode === 'outside') {
+      outsideBee(b, dt);
+      b.trailT = (b.trailT || 0) + dt;
+      if (b.trailT > 0.12) {
+        b.trailT = 0;
+        b.trail.push({ x: b.x, y: b.y });
+        if (b.trail.length > 45) b.trail.shift();
+      }
+    } else {
+      insideBee(b, dt);
+    }
+  }
+
+  // Ageing: bees die at ~42 bee-days; brood then emerges as new young bees
+  let deaths = 0;
+  for (const b of bees) {
+    b.age += dt / BEE_DAY_S;
+    if (!b.dying && b.age >= 42) b.dying = true;
+  }
+  bees = bees.filter((b) => {
+    if (!b.dying || b.alpha > 0) return true;
+    if (b.dance) removeDance(b);
+    if (b.cell) { b.cell.owner = null; b.cell = null; }
+    deaths++;
+    return false;
+  });
+  for (let i = 0; i < deaths; i++) {
+    const nb = spawnInside(0);
+    nb.task = 'clean';
+    bees.push(nb);
+  }
+
+  // Nectar ripens: water drains until ~18%, then the cell is capped with wax
+  for (const c of cells.values()) {
+    if (c.state !== 'built') continue;
+    if (c.mg <= 0.01) { c.mg = 0; c.capped = false; c.water = WATER_START; continue; }
+    if (c.capped) continue;
+    c.water -= RIPEN_RATE * dt;
+    if (c.water <= WATER_RIPE) c.capped = true;
+  }
+
+  for (const f of flakes) { f.x += f.vx * dt; f.y += f.vy * dt; f.vy -= 0.4 * dt; f.life -= dt; }
+  flakes = flakes.filter((f) => f.life > 0);
+}
+
+/* ---------- Rendering ---------- */
+const canvas = document.getElementById('view');
+const ctx = canvas.getContext('2d');
+let VW = 1, VH = 1, DPR = 1, ppm = 30, ox = 0, oy = 0;
+const GRASS = Array.from({ length: 260 }, () => ({ x: rand(-1, GARDEN_W + 1), h: rand(0.12, 0.45), k: rand(0, TAU) }));
+const CLOUDS = [{ x: 4, y: 17.2, s: 1.0 }, { x: 16, y: 18.6, s: 1.3 }, { x: 27, y: 16.6, s: 0.9 }, { x: 35, y: 18.3, s: 1.1 }];
+const STARS = Array.from({ length: 70 }, () => ({ u: Math.random(), v: Math.random() * 0.6, r: rand(0.5, 1.4) }));
+
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  VW = window.innerWidth; VH = window.innerHeight;
+  canvas.width = Math.round(VW * DPR); canvas.height = Math.round(VH * DPR);
+  const availW = VW - 24, availH = VH - 110;   // leave room for the controls at the bottom
+  ppm = Math.min(availW / GARDEN_W, availH / GARDEN_H);
+  ox = (VW - GARDEN_W * ppm) / 2;
+  oy = 16 + (availH - GARDEN_H * ppm) / 2;     // screen y of the top edge of the world
+}
+// Metres (y up) to CSS pixels, and back
+function toScreen(x, y) { return [ox + x * ppm, oy + (GARDEN_H - y) * ppm]; }
+function toWorld(px, py) { return [(px - ox) / ppm, GARDEN_H - (py - oy) / ppm]; }
+function setScreen() { ctx.setTransform(DPR, 0, 0, DPR, 0, 0); }
+// Draw in metres with y pointing up, so bee and comb geometry read straight off the model
+function setWorld() { ctx.setTransform(DPR * ppm, 0, 0, -DPR * ppm, DPR * ox, DPR * (oy + GARDEN_H * ppm)); }
+
+const mix = (a, b, k) => a.map((v, i) => v + (b[i] - v) * k);
+const rgb = (c, al = 1) => `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},${al})`;
+
+function hexPath(x, y, r) {
+  ctx.beginPath();
+  for (let k = 0; k < 6; k++) {
+    const a = Math.PI / 2 + k * Math.PI / 3;   // pointy-top: vertex at the top
+    const px = x + r * Math.cos(a), py = y + r * Math.sin(a);
+    if (k) ctx.lineTo(px, py); else ctx.moveTo(px, py);
+  }
+  ctx.closePath();
+}
+
+function drawSky(time) {
+  setScreen();
+  const k = smooth(-0.12, 0.2, sun.elev);               // 0 at night, 1 at day
+  const glow = Math.max(0, 1 - Math.abs(sun.elev) * 5); // sunrise and sunset colours
+  const top = mix([12, 22, 48], [96, 172, 236], k);
+  const horizon = mix(mix([46, 46, 92], [255, 168, 104], glow), [206, 236, 255], k);
+  const g = ctx.createLinearGradient(0, 0, 0, VH);
+  g.addColorStop(0, rgb(top)); g.addColorStop(0.7, rgb(horizon)); g.addColorStop(1, rgb(horizon));
+  ctx.fillStyle = g; ctx.fillRect(0, 0, VW, VH);
+
+  if (k < 0.6) {                                        // stars fade in at night
+    ctx.fillStyle = `rgba(255,255,240,${(0.6 - k) * 0.9})`;
+    for (const s of STARS) {
+      const [sx, sy] = toScreen(s.u * GARDEN_W, GARDEN_H * (0.55 + s.v * 0.45));
+      ctx.beginPath(); ctx.arc(sx, sy, s.r, 0, TAU); ctx.fill();
+    }
+  }
+  // Sun disc and glow (the same direction the dance uses as "up")
+  const [px, py] = toScreen(18 + 17 * sun.vx, 1.5 + 17 * sun.vy);
+  if (sun.elev > -0.15) {
+    const rg = ctx.createRadialGradient(px, py, 0, px, py, 150);
+    rg.addColorStop(0, `rgba(255,236,170,${0.85 * smooth(-0.15, 0.1, sun.elev)})`);
+    rg.addColorStop(1, 'rgba(255,236,170,0)');
+    ctx.fillStyle = rg; ctx.fillRect(px - 150, py - 150, 300, 300);
+    ctx.fillStyle = '#ffe98a';
+    ctx.beginPath(); ctx.arc(px, py, 22, 0, TAU); ctx.fill();
+  }
+  // Distant hills
+  const gy = toScreen(0, 0)[1];
+  ctx.fillStyle = rgb(mix([40, 70, 80], [120, 170, 96], k));
+  ctx.beginPath(); ctx.moveTo(0, gy);
+  for (let x = 0; x <= VW; x += 8) ctx.lineTo(x, gy - 46 - 26 * Math.sin(x / 150) - 12 * Math.sin(x / 47 + 1));
+  ctx.lineTo(VW, gy); ctx.closePath(); ctx.fill();
+}
+
+function drawClouds() {
+  setWorld();
+  const a = 0.45 + 0.4 * smooth(-0.1, 0.2, sun.elev);
+  ctx.fillStyle = `rgba(255,255,255,${a})`;
+  for (const c of CLOUDS) {
+    const cx = ((c.x + t * wind.x * 0.25) % 46 + 46) % 46 - 5;
+    for (const [dx, dy, r] of [[0, 0, 0.7], [0.8, 0.15, 0.9], [1.6, 0, 0.6], [-0.8, -0.05, 0.55]]) {
+      ctx.beginPath(); ctx.arc(cx + dx * c.s, c.y + dy * c.s, r * c.s, 0, TAU); ctx.fill();
+    }
+  }
+}
+
+function drawGround(time) {
+  setWorld();
+  const k = smooth(-0.12, 0.2, sun.elev);
+  ctx.fillStyle = rgb(mix([24, 44, 30], [92, 158, 62], k));
+  ctx.fillRect(-2, -12, GARDEN_W + 4, 12);
+  ctx.strokeStyle = rgb(mix([30, 60, 36], [70, 140, 48], k));
+  ctx.lineWidth = 0.05; ctx.lineCap = 'round';
+  ctx.beginPath();
+  for (const g of GRASS) {
+    const sway = (0.05 + 0.05 * wind.x) * Math.sin(time * 1.4 + g.k) * g.h;
+    ctx.moveTo(g.x, 0); ctx.lineTo(g.x + sway, g.h);
+  }
+  ctx.stroke();
+}
+
+function drawHive() {
+  setWorld();
+  const { x0, x1, y0, y1 } = HIVE;
+  // stand
+  ctx.fillStyle = '#7a5530';
+  for (const lx of [x0 + 0.6, (x0 + x1) / 2, x1 - 0.6]) ctx.fillRect(lx - 0.07, 0, 0.14, y0 - 0.25);
+  ctx.fillRect(x0 - 0.3, y0 - 0.25, x1 - x0 + 0.6, 0.25);
+  // box: wood walls around the comb cavity
+  ctx.fillStyle = '#6b4a24';
+  ctx.fillRect(x0 - 0.15, y0 - 0.12, x1 - x0 + 0.3, y1 - y0 + 0.24);
+  ctx.fillStyle = '#c58c4e';
+  ctx.fillRect(x0 - 0.15, y1 + 0.02, x1 - x0 + 0.3, 0.14);
+  ctx.fillStyle = '#4b3418';
+  ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
+  // gabled roof (cover board)
+  ctx.fillStyle = '#a86f35';
+  ctx.beginPath();
+  ctx.moveTo(x0 - 0.4, y1 + 0.16); ctx.lineTo((x0 + x1) / 2, y1 + 0.85); ctx.lineTo(x1 + 0.4, y1 + 0.16); ctx.closePath();
+  ctx.fill();
+  // landing board and entrance
+  ctx.fillStyle = '#b9824a';
+  ctx.fillRect(x1 - 0.05, y0 + 0.28, 0.75, 0.14);
+  ctx.fillStyle = '#21150a';
+  ctx.fillRect(x1 - 0.14, y0 + 0.3, 0.14, 0.2);
+}
+
+function drawCombCells() {
+  setWorld();
+  for (const c of cells.values()) {
+    if (c.state === 'building') {                     // walls rise one by one as wax is laid
+      hexPath(c.x, c.y, CELL_S * 0.96);
+      ctx.fillStyle = `rgba(246,232,186,${0.25 + 0.4 * c.prog})`; ctx.fill();
+      ctx.strokeStyle = '#c9a25a'; ctx.lineWidth = 0.025;
+      ctx.beginPath();
+      for (let k = 0; k < 6; k++) {
+        const frac = clamp(c.prog * 6 - k, 0, 1);
+        if (frac <= 0) continue;
+        const a0 = Math.PI / 2 + k * Math.PI / 3, a1 = a0 + Math.PI / 3 * frac;
+        ctx.moveTo(c.x + CELL_S * Math.cos(a0), c.y + CELL_S * Math.sin(a0));
+        ctx.lineTo(c.x + CELL_S * Math.cos(a1), c.y + CELL_S * Math.sin(a1));
+      }
+      ctx.stroke();
+      continue;
+    }
+    hexPath(c.x, c.y, CELL_S * 0.96);
+    ctx.fillStyle = '#efd38a'; ctx.fill();
+    if (c.mg > 0) {                                  // nectar → honey, bottom up
+      const ripe = clamp((WATER_START - c.water) / (WATER_START - WATER_RIPE), 0, 1);
+      const col = mix([236, 246, 176], [214, 136, 26], ripe);
+      const fill = clamp(c.mg / CELL_CAP, 0, 1);
+      ctx.save(); hexPath(c.x, c.y, CELL_S * 0.96); ctx.clip();
+      ctx.fillStyle = rgb(col);
+      ctx.fillRect(c.x - CELL_S, c.y - CELL_S, 2 * CELL_S, 2 * CELL_S * fill);
+      ctx.restore();
+    }
+    if (c.capped) {                                  // wax cap on ripe honey
+      hexPath(c.x, c.y, CELL_S * 0.7);
+      ctx.fillStyle = '#fbf1d2'; ctx.fill();
+      ctx.strokeStyle = '#d8b567'; ctx.lineWidth = 0.012; ctx.stroke();
+    }
+    hexPath(c.x, c.y, CELL_S * 0.96);
+    ctx.strokeStyle = '#b68a40'; ctx.lineWidth = 0.02; ctx.stroke();
+  }
+}
+
+function drawFlowers(time) {
+  setWorld();
+  const bloom = smooth(0.05, 0.35, sun.daylight);
+  ctx.lineCap = 'round';
+  for (const f of flowers) {
+    const sway = 0.12 * f.h * Math.sin(time * 1.1 + f.sway) + 0.05 * f.h * wind.x / 1.5;
+    const hx = f.x + sway, hy = f.h;
+    ctx.strokeStyle = '#3f8a3a'; ctx.lineWidth = 0.05;
+    ctx.beginPath(); ctx.moveTo(f.x, 0); ctx.quadraticCurveTo(f.x + sway * 0.3, f.h * 0.5, hx, hy); ctx.stroke();
+    ctx.fillStyle = '#56a54a';                       // two leaves
+    for (const side of [-1, 1]) {
+      ctx.beginPath(); ctx.ellipse(f.x + sway * 0.25 + side * 0.18, f.h * 0.35, 0.18, 0.06, side * 0.5, 0, TAU); ctx.fill();
+    }
+    const sp = SPECIES[f.sp];
+    if (bloom < 0.1) {                               // closed bud at night
+      ctx.fillStyle = '#4f9a48';
+      ctx.beginPath(); ctx.ellipse(hx, hy, 0.12, 0.2, 0, 0, TAU); ctx.fill();
+      continue;
+    }
+    const r = 0.1 + 0.2 * bloom;
+    ctx.fillStyle = sp.petal;
+    for (let k = 0; k < 8; k++) {
+      const a = k * TAU / 8 + f.sway;
+      ctx.beginPath(); ctx.ellipse(hx + Math.cos(a) * r * 0.62, hy + Math.sin(a) * r * 0.62, r * 0.55, r * 0.3, a, 0, TAU); ctx.fill();
+    }
+    ctx.fillStyle = sp.eye;
+    ctx.beginPath(); ctx.arc(hx, hy, r * 0.42, 0, TAU); ctx.fill();
+    // nectar meter: a ring whose length is the nectar in the flower
+    ctx.strokeStyle = 'rgba(255,214,70,0.9)'; ctx.lineWidth = 0.04;
+    ctx.beginPath(); ctx.arc(hx, hy, r + 0.12, -Math.PI / 2, -Math.PI / 2 + TAU * clamp(f.nectar / FLOWER_CAP, 0, 1)); ctx.stroke();
+  }
+}
+
+function drawDances() {
+  if (!showDance || !dances.length) return;
+  setWorld();
+  for (const d of dances) {
+    const L = 0.9;
+    const ax = d.x - Math.sin(d.angle) * L, ay = d.y + Math.cos(d.angle) * L;   // run direction from "up"
+    ctx.strokeStyle = 'rgba(255,90,150,0.85)'; ctx.fillStyle = 'rgba(255,90,150,0.85)';
+    ctx.lineWidth = 0.04;
+    ctx.beginPath(); ctx.moveTo(d.x, d.y + 0.5); ctx.lineTo(ax, ay + 0.5); ctx.stroke();
+  }
+}
+
+function drawTrails() {
+  if (!showTrails) return;
+  setWorld();
+  ctx.lineWidth = 1.2 / ppm; ctx.lineJoin = 'round';
+  ctx.strokeStyle = 'rgba(255,214,90,0.45)';
+  for (const b of bees) {
+    if (b.mode !== 'outside' || b.trail.length < 2) continue;
+    ctx.beginPath(); ctx.moveTo(b.trail[0].x, b.trail[0].y);
+    for (const p of b.trail) ctx.lineTo(p.x, p.y);
+    ctx.lineTo(b.x, b.y); ctx.stroke();
+  }
+}
+
+function drawFlakes() {
+  setWorld();
+  for (const f of flakes) {
+    ctx.fillStyle = `rgba(255,252,236,${clamp(f.life / 1.5, 0, 1)})`;
+    ctx.beginPath(); ctx.arc(f.x, f.y, 0.035, 0, TAU); ctx.fill();
+  }
+}
+
+// One bee: 0.47 m drawn long for legibility (real: 1.2 cm). Wings beat only in flight or
+// while dancing; inside the hive they are folded. Facing follows the direction of travel.
+function drawBee(b, time) {
+  const flying = b.mode === 'outside' && b.sub !== 'feed';
+  const sp = Math.hypot(b.vx, b.vy);
+  let ang;
+  if (b.mode === 'outside') ang = sp > 0.25 ? Math.atan2(b.vy, b.vx) : (b.vx < -0.05 ? Math.PI : 0);
+  else ang = b.flip < 0 ? Math.PI : 0;
+  const buzzing = flying || (b.task === 'dance' && b.sub === 'dancing');
+  const flap = buzzing ? Math.sin(time * TAU * 26 + b.id) : 0;   // visual flutter, not the real 230 Hz
+  ctx.save();
+  ctx.translate(b.x, b.y);
+  ctx.rotate(ang);
+  ctx.globalAlpha = clamp(b.alpha, 0, 1);
+  ctx.lineWidth = 1.2 / ppm;
+  // wings
+  ctx.fillStyle = buzzing ? 'rgba(236,246,255,0.5)' : 'rgba(228,238,248,0.85)';
+  ctx.strokeStyle = 'rgba(110,130,150,0.6)';
+  for (const side of [-1, 1]) {
+    ctx.beginPath();
+    ctx.ellipse(-0.02, side * 0.1, 0.15, 0.045 + (buzzing ? 0.035 * Math.abs(flap) : 0), side * 0.12, 0, TAU);
+    ctx.fill(); ctx.stroke();
+  }
+  // abdomen with black bands, dark thorax, head, eyes, antennae
+  ctx.fillStyle = '#f2c230';
+  ctx.beginPath(); ctx.ellipse(-0.08, 0, 0.14, 0.085, 0, 0, TAU); ctx.fill();
+  ctx.save();
+  ctx.beginPath(); ctx.ellipse(-0.08, 0, 0.14, 0.085, 0, 0, TAU); ctx.clip();
+  ctx.fillStyle = '#2a1d10';
+  for (const bx of [-0.2, -0.13, -0.06]) ctx.fillRect(bx, -0.1, 0.04, 0.2);
+  ctx.restore();
+  ctx.fillStyle = '#2a1d10';
+  ctx.beginPath(); ctx.ellipse(0.07, 0, 0.08, 0.075, 0, 0, TAU); ctx.fill();
+  ctx.beginPath(); ctx.arc(0.17, 0, 0.065, 0, TAU); ctx.fill();
+  ctx.fillStyle = '#6e4312';
+  ctx.beginPath(); ctx.arc(0.19, 0.035, 0.022, 0, TAU); ctx.arc(0.19, -0.035, 0.022, 0, TAU); ctx.fill();
+  ctx.strokeStyle = '#2a1d10';
+  ctx.beginPath(); ctx.moveTo(0.22, 0.02); ctx.quadraticCurveTo(0.31, 0.11, 0.34, 0.07); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0.22, -0.02); ctx.quadraticCurveTo(0.31, -0.11, 0.34, -0.07); ctx.stroke();
+  // nectar load: a small gold tint on the abdomen when the crop is full
+  if (b.load > 1) {
+    ctx.fillStyle = `rgba(255,236,120,${0.35 * clamp(b.load / LOAD_MAX, 0, 1)})`;
+    ctx.beginPath(); ctx.ellipse(-0.1, 0, 0.12, 0.07, 0, 0, TAU); ctx.fill();
+  }
+  ctx.restore();
+}
+
+function describe(b) {
+  if (b.mode === 'outside') {
+    if (b.sub === 'feed') return `feeding on ${SPECIES[flowers[b.flower].sp].name}`;
+    if (b.sub === 'toHive') return 'flying home with nectar';
+    if (b.recruit) return 'flying to a danced location';
+    return 'flying to a flower';
+  }
+  if (b.task === 'forage') return b.sub === 'unload' ? 'handing crop to a receiver' : b.sub === 'released' ? 'resting after unloading' : 'waiting to leave on a trip';
+  if (b.task === 'receive') return b.sub === 'toForager' ? 'taking nectar from a forager' : b.sub === 'toCell' ? 'packing nectar into a cell' : 'waiting for nectar';
+  if (b.task === 'build') return b.sub === 'building' ? 'secreting wax' : 'walking to a cell to build';
+  if (b.task === 'dance') return b.sub === 'dancing' ? 'waggle dancing' : 'walking to the dance floor';
+  return { clean: 'cleaning cells', rest: 'resting on the comb' }[b.task] || b.task;
+}
+
+/* ---------- Stats panel ---------- */
+const statTable = document.getElementById('statTable');
+let hudTimer = 0;
+function updateHud() {
+  const counts = { out: 0, recv: 0, build: 0, rest: 0, dance: 0, carry: 0 };
+  for (const b of bees) {
+    if (b.dying) continue;
+    if (b.mode === 'outside') { counts.out++; counts.carry += b.load; continue; }
+    if (b.task === 'receive') counts.recv++;
+    else if (b.task === 'build') counts.build++;
+    else if (b.task === 'dance') counts.dance++;
+    else counts.rest++;                     // resting, cleaning, waiting to forage
+  }
+  let built = 0, capped = 0, building = 0, stored = 0;
+  for (const c of cells.values()) {
+    if (c.state === 'building') building++;
+    else { built++; if (c.capped) capped++; }
+    stored += c.mg;
+  }
+  let flowerNectar = 0, openFlowers = 0;
+  for (const f of flowers) { flowerNectar += f.nectar; if (f.open) openFlowers++; }
+  const hh = Math.floor(sun.hour), mm = Math.floor((sun.hour - hh) * 60);
+  const rows = [
+    ['<div class="sec">Time & weather</div>', ''],
+    ['Clock', `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`],
+    ['Light', sun.daylight < 0.3 ? 'too dark to fly' : `${Math.round(sun.daylight * 100)}%`],
+    ['Wind', `${wind.x.toFixed(1)} m/s`],
+    ['<div class="sec">Bees</div>', ''],
+    ['Population', bees.filter((b) => !b.dying).length],
+    ['Foraging outside', counts.out],
+    ['Receiving nectar', counts.recv],
+    ['Building wax', counts.build],
+    ['Dancing', counts.dance],
+    ['Resting / cleaning', counts.rest],
+    ['Crop load in the air', `${counts.carry.toFixed(0)} mg`],
+    ['<div class="sec">Comb</div>', ''],
+    ['Cells built', built],
+    ['Honey (capped)', capped],
+    ['Cells in progress', building],
+    ['Nectar & honey stored', `${stored.toFixed(0)} mg`],
+    ['<div class="sec">Garden</div>', ''],
+    ['Flowers open', `${openFlowers} / ${flowers.length}`],
+    ['Nectar in flowers', `${flowerNectar.toFixed(0)} mg`],
+    ['<div class="sec">Totals</div>', ''],
+    ['Trips started', stats.trips],
+    ['Nectar delivered', `${stats.delivered.toFixed(0)} mg`],
+    ['Waggle dances', stats.dances],
+    ['Cells completed', stats.cellsDone],
+  ];
+  statTable.innerHTML = rows.map(([k, v]) => (v === '' ? `<tr><td colspan="2">${k}</td></tr>` : `<tr><td>${k}</td><td>${v}</td></tr>`)).join('');
+}
+
+/* ---------- Hover tooltip ---------- */
+const tip = document.getElementById('tip');
+let mouse = null;
+canvas.addEventListener('pointermove', (e) => { mouse = { x: e.clientX, y: e.clientY }; });
+canvas.addEventListener('pointerleave', () => { mouse = null; tip.style.display = 'none'; });
+function updateTip() {
+  if (!mouse) { tip.style.display = 'none'; return; }
+  const [wx, wy] = toWorld(mouse.x, mouse.y);
+  let best = null, bestD = 0.45;
+  for (const b of bees) {
+    const d = dist(wx, wy, b.x, b.y);
+    if (d < bestD) { bestD = d; best = b; }
+  }
+  if (!best) { tip.style.display = 'none'; return; }
+  const place = best.mode === 'outside' ? 'in the air' : 'in the hive';
+  tip.innerHTML = `<b>Honeybee #${best.id}</b><br>${describe(best)}<br>` +
+    `Age ${Math.floor(best.age)} bee-days · ${place}` +
+    (best.load > 0.5 ? `<br>Crop: ${best.load.toFixed(0)} of ${LOAD_MAX} mg nectar` : '');
+  tip.style.display = 'block';
+  tip.style.left = Math.min(mouse.x + 16, VW - 250) + 'px';
+  tip.style.top = Math.min(mouse.y + 16, VH - 120) + 'px';
+}
+
+/* ---------- Controls ---------- */
+const playBtn = document.getElementById('playBtn');
+playBtn.addEventListener('click', () => {
+  paused = !paused;
+  playBtn.textContent = paused ? 'Play' : 'Pause';
+});
+document.querySelectorAll('.spd').forEach((btn) => btn.addEventListener('click', () => {
+  speed = Number(btn.dataset.speed);
+  document.querySelectorAll('.spd').forEach((b) => b.classList.toggle('on', b === btn));
+}));
+document.getElementById('trails').addEventListener('change', (e) => { showTrails = e.target.checked; });
+document.getElementById('showDance').addEventListener('change', (e) => { showDance = e.target.checked; });
+document.getElementById('reset').addEventListener('click', () => resetWorld());
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'Space') { e.preventDefault(); playBtn.click(); }
+});
+
+/* ---------- Render and main loop ---------- */
+function render(time) {
+  drawSky(time);
+  drawClouds();
+  drawGround(time);
+  drawHive();
+  drawCombCells();
+  drawFlowers(time);
+  drawTrails();
+  drawDances();
+  drawFlakes();
+  for (const b of bees) drawBee(b, time);
+}
+
+const SIM_DT = 1 / 60;
+let lastNow = performance.now(), acc = 0;
+function frame(now) {
+  const real = Math.min(0.1, (now - lastNow) / 1000);
+  lastNow = now;
+  if (!paused) {
+    acc += real * speed;
+    let n = 0;
+    while (acc >= SIM_DT && n < 300) { step(SIM_DT); acc -= SIM_DT; n++; }
+    if (acc > 0.5) acc = 0;
+  }
+  render(now / 1000);
+  hudTimer -= real;
+  if (hudTimer <= 0) { hudTimer = 0.25; updateHud(); }
+  updateTip();
+  requestAnimationFrame(frame);
+}
+
+resetWorld();
+resize();
+window.addEventListener('resize', resize);
+requestAnimationFrame((now) => { lastNow = now; frame(now); });
+
+})();
+</script>
+</body>
+</html>
